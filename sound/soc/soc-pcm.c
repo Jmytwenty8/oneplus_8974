@@ -494,9 +494,9 @@ static int soc_pcm_close(struct snd_pcm_substream *substream)
 				SND_SOC_DAPM_STREAM_STOP);
 		} else {
 			/* start delayed pop wq here for playback streams */
-			rtd->pop_wait = 1;
-			schedule_delayed_work(&rtd->delayed_work,
-				msecs_to_jiffies(rtd->pmdown_time));
+			queue_delayed_work(system_power_efficient_wq,
+					   &rtd->delayed_work,
+					   msecs_to_jiffies(rtd->pmdown_time));
 		}
 	} else {
 		/* capture streams can be powered down now */
