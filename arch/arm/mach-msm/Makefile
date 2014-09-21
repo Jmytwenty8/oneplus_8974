@@ -427,3 +427,4 @@ obj-$(CONFIG_PERFMAP) += perfmap.o
 
 obj-$(CONFIG_CHARGE_LEVEL) += charge_level.o
 obj-$(CONFIG_TURBO_BOOST) += msm_turbo.o
+obj-$(CONFIG_BLU_PLUG) += blu_plug.o 
