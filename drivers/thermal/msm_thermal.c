@@ -2475,724 +2475,155 @@ static int msm_thermal_add_psm_nodes(void)
 		goto psm_node_exit;
 	}
 
-	psm_kobj = kobject_create_and_add("pmic_sw_mode", module_kobj);
-	if (!psm_kobj) {
-		pr_err("cannot create psm kobject\n");
-		rc = -ENOMEM;
-		goto psm_node_exit;
-	}
+unsigned int temp_threshold = 70;
+module_param(temp_threshold, int, 0755);
 
-	for (i = 0; i < psm_rails_cnt; i++) {
-		psm_reg_kobj[i] = kobject_create_and_add(psm_rails[i].name,
-					psm_kobj);
-		if (!psm_reg_kobj[i]) {
-			pr_err("cannot create kobject for %s\n",
-					psm_rails[i].name);
-			rc = -ENOMEM;
-			goto psm_node_exit;
-		}
-		psm_rails[i].attr_gp.attrs = kzalloc( \
-				sizeof(struct attribute *) * 2, GFP_KERNEL);
-		if (!psm_rails[i].attr_gp.attrs) {
-			pr_err("kzalloc failed\n");
-			rc = -ENOMEM;
-			goto psm_node_exit;
-		}
+static struct thermal_info {
+	uint32_t cpuinfo_max_freq;
+	uint32_t limited_max_freq;
+	unsigned int safe_diff;
+	bool throttling;
+	bool pending_change;
+} info = {
+	.cpuinfo_max_freq = LONG_MAX,
+	.limited_max_freq = LONG_MAX,
+	.safe_diff = 5,
+	.throttling = false,
+	.pending_change = false,
+};
 
-		PSM_RW_ATTRIB(psm_rails[i], psm_rails[i].mode_attr, 0, mode);
-		psm_rails[i].attr_gp.attrs[1] = NULL;
+enum thermal_freqs {
+	FREQ_HELL		= 729600,
+	FREQ_VERY_HOT		= 1036800,
+	FREQ_HOT		= 1267200,
+	FREQ_WARM		= 1497600,
+};
 
-		rc = sysfs_create_group(psm_reg_kobj[i], &psm_rails[i].attr_gp);
-		if (rc) {
-			pr_err("cannot create attribute group for %s. err:%d\n",
-					psm_rails[i].name, rc);
-			goto psm_node_exit;
-		}
-	}
+enum threshold_levels {
+	LEVEL_HELL		= 12,
+	LEVEL_VERY_HOT		= 9,
+	LEVEL_HOT		= 5,
+};
 
-	return rc;
+static struct msm_thermal_data msm_thermal_info;
 
-psm_node_exit:
-	if (rc) {
-		for (i = 0; i < psm_rails_cnt; i++) {
-			kobject_del(psm_reg_kobj[i]);
-			kfree(psm_rails[i].attr_gp.attrs);
-		}
-		if (psm_kobj)
-			kobject_del(psm_kobj);
-	}
-	return rc;
+static struct delayed_work check_temp_work;
+
+unsigned short get_threshold(void)
+{
+	return temp_threshold;
 }
 
-static int probe_vdd_rstr(struct device_node *node,
-		struct msm_thermal_data *data, struct platform_device *pdev)
+static int msm_thermal_cpufreq_callback(struct notifier_block *nfb,
+		unsigned long event, void *data)
 {
-	int ret = 0;
-	int i = 0;
-	int arr_size;
-	char *key = NULL;
-	struct device_node *child_node = NULL;
+	struct cpufreq_policy *policy = data;
 
-	rails = NULL;
+	if (event != CPUFREQ_ADJUST && !info.pending_change)
+		return 0;
 
-	key = "qcom,vdd-restriction-temp";
-	ret = of_property_read_u32(node, key, &data->vdd_rstr_temp_degC);
-	if (ret)
-		goto read_node_fail;
+	cpufreq_verify_within_limits(policy, policy->cpuinfo.min_freq,
+		info.limited_max_freq);
 
-	key = "qcom,vdd-restriction-temp-hysteresis";
-	ret = of_property_read_u32(node, key, &data->vdd_rstr_temp_hyst_degC);
-	if (ret)
-		goto read_node_fail;
-
-	for_each_child_of_node(node, child_node) {
-		rails_cnt++;
-	}
-
-	if (rails_cnt == 0)
-		goto read_node_fail;
-	if (rails_cnt >= MAX_RAILS) {
-		pr_err("Too many rails:%d.\n", rails_cnt);
-		return -EFAULT;
-	}
-
-	rails = kzalloc(sizeof(struct rail) * rails_cnt,
-				GFP_KERNEL);
-	if (!rails) {
-		pr_err("Fail to allocate memory for rails.\n");
-		return -ENOMEM;
-	}
-
-	i = 0;
-	for_each_child_of_node(node, child_node) {
-		key = "qcom,vdd-rstr-reg";
-		ret = of_property_read_string(child_node, key, &rails[i].name);
-		if (ret)
-			goto read_node_fail;
-
-		key = "qcom,levels";
-		if (!of_get_property(child_node, key, &arr_size))
-			goto read_node_fail;
-		rails[i].num_levels = arr_size/sizeof(__be32);
-		if (rails[i].num_levels >
-			sizeof(rails[i].levels)/sizeof(uint32_t)) {
-			pr_err("Array size:%d too large for index:%d\n",
-				rails[i].num_levels, i);
-			return -EFAULT;
-		}
-		ret = of_property_read_u32_array(child_node, key,
-				rails[i].levels, rails[i].num_levels);
-		if (ret)
-			goto read_node_fail;
-
-		key = "qcom,freq-req";
-		rails[i].freq_req = of_property_read_bool(child_node, key);
-		if (rails[i].freq_req)
-			rails[i].min_level = 0;
-		else {
-			key = "qcom,min-level";
-			ret = of_property_read_u32(child_node, key,
-				&rails[i].min_level);
-			if (ret)
-				goto read_node_fail;
-		}
-
-		rails[i].curr_level = -1;
-		rails[i].reg = NULL;
-		i++;
-	}
-
-	if (rails_cnt) {
-		ret = vdd_restriction_reg_init(pdev);
-		if (ret) {
-			pr_err("Err regulator init. err:%d. KTM continues.\n",
-					ret);
-			goto read_node_fail;
-		}
-		ret = init_threshold(MSM_VDD_RESTRICTION, MONITOR_ALL_TSENS,
-			data->vdd_rstr_temp_hyst_degC, data->vdd_rstr_temp_degC,
-			vdd_restriction_notify);
-		if (ret) {
-			pr_err("Error in initializing thresholds. err:%d\n",
-					ret);
-			goto read_node_fail;
-		}
-		vdd_rstr_enabled = true;
-	}
-read_node_fail:
-	vdd_rstr_probed = true;
-	if (ret) {
-		dev_info(&pdev->dev,
-		"%s:Failed reading node=%s, key=%s. err=%d. KTM continues\n",
-			__func__, node->full_name, key, ret);
-		kfree(rails);
-		rails_cnt = 0;
-	}
-	if (ret == -EPROBE_DEFER)
-		vdd_rstr_probed = false;
-	return ret;
+	return 0;
 }
 
-static int get_efuse_temp_map(struct device_node *node,
-				int *efuse_values,
-				int *efuse_temp)
+static struct notifier_block msm_thermal_cpufreq_notifier = {
+	.notifier_call = msm_thermal_cpufreq_callback,
+};
+
+static void limit_cpu_freqs(uint32_t max_freq)
 {
-	uint32_t i, j, efuse_arr_cnt = 0;
-	int ret = 0, efuse_map_cnt = 0;
-	uint32_t data[2 * MAX_EFUSE_VALUE];
+	unsigned int cpu;
 
-	char *key = "qcom,efuse-temperature-map";
-	if (!of_get_property(node, key, &efuse_map_cnt)
-		|| efuse_map_cnt <= 0) {
-		pr_debug("Property %s not defined.\n", key);
-		return -ENODEV;
+	if (info.limited_max_freq == max_freq)
+		return;
+
+	info.limited_max_freq = max_freq;
+
+	info.pending_change = true;
+
+	get_online_cpus();
+	for_each_online_cpu(cpu)
+	{
+		cpufreq_update_policy(cpu);
+		pr_info("%s: Setting cpu%d max frequency to %d\n",
+				KBUILD_MODNAME, cpu, info.limited_max_freq);
 	}
+	put_online_cpus();
 
-	if (efuse_map_cnt % (sizeof(__be32) * 2)) {
-		pr_err("Invalid number(%d) of entry for %s\n",
-				efuse_map_cnt, key);
-		return -EINVAL;
-	}
-
-	efuse_arr_cnt = efuse_map_cnt / sizeof(__be32);
-
-	ret = of_property_read_u32_array(node, key, data, efuse_arr_cnt);
-	if (ret)
-		return -EINVAL;
-
-	efuse_map_cnt /= (sizeof(__be32) * 2);
-
-	j = 0;
-	for (i = 0; i < efuse_map_cnt; i++) {
-		efuse_values[i] = data[j++];
-		efuse_temp[i] = data[j++];
-	}
-
-	return efuse_map_cnt;
+	info.pending_change = false;
 }
 
-static int probe_thermal_efuse_read(struct device_node *node,
-			struct msm_thermal_data *data,
-			struct platform_device *pdev)
+static void check_temp(struct work_struct *work)
 {
-	u64 efuse_bits;
-	int ret = 0;
-	int i = 0;
-	int efuse_map_cnt = 0;
-	int efuse_data_cnt = 0;
-	char *key = NULL;
-	void __iomem *efuse_base = NULL;
-	uint32_t efuse_data[EFUSE_DATA_MAX] = {0};
-	uint32_t efuse_values[MAX_EFUSE_VALUE] = {0};
-	uint32_t efuse_temp[MAX_EFUSE_VALUE] = {0};
-	uint32_t default_temp = 0;
-	uint8_t thermal_efuse_data = 0;
+	struct tsens_device tsens_dev;
+	uint32_t freq = 0;
+	long temp = 0;
 
-	if (default_temp_limit_probed)
-		goto read_efuse_exit;
+	tsens_dev.sensor_num = msm_thermal_info.sensor_id;
+	tsens_get_temp(&tsens_dev, &temp);
 
-	key = "qcom,default-temp";
-	if (of_property_read_u32(node, key, &default_temp))
-		default_temp = 0;
-
-	default_cpu_temp_limit = default_temp;
-
-	key = "qcom,efuse-data";
-	if (!of_get_property(node, key, &efuse_data_cnt) ||
-		efuse_data_cnt <= 0) {
-		ret = -ENODEV;
-		goto read_efuse_fail;
-	}
-	efuse_data_cnt /= sizeof(__be32);
-
-	if (efuse_data_cnt != EFUSE_DATA_MAX) {
-		pr_err("Invalid number of efuse data. data cnt %d\n",
-			efuse_data_cnt);
-		ret = -EINVAL;
-		goto read_efuse_fail;
-	}
-
-	ret = of_property_read_u32_array(node, key, efuse_data,
-						efuse_data_cnt);
-	if (ret)
-		goto read_efuse_fail;
-
-	if (efuse_data[EFUSE_ADDRESS] == 0 ||
-		efuse_data[EFUSE_SIZE] == 0 ||
-		efuse_data[EFUSE_BIT_MASK] == 0) {
-		pr_err("Invalid efuse data: address:%x len:%d bitmask%x\n",
-			efuse_data[EFUSE_ADDRESS], efuse_data[EFUSE_SIZE],
-			efuse_data[EFUSE_BIT_MASK]);
-		ret = -EINVAL;
-		goto read_efuse_fail;
-	}
-
-	efuse_map_cnt = get_efuse_temp_map(node, efuse_values,
-						efuse_temp);
-	if (efuse_map_cnt <= 0 ||
-		efuse_map_cnt > (efuse_data[EFUSE_BIT_MASK] + 1)) {
-		pr_err("Invalid efuse-temperature-map. cnt%d\n",
-			efuse_map_cnt);
-		ret = -EINVAL;
-		goto read_efuse_fail;
-	}
-
-	efuse_base = ioremap(efuse_data[EFUSE_ADDRESS], efuse_data[EFUSE_SIZE]);
-	if (!efuse_base) {
-		pr_err("Unable to map efuse_addr:%x with size%d\n",
-			efuse_data[EFUSE_ADDRESS],
-			efuse_data[EFUSE_SIZE]);
-		ret = -EINVAL;
-		goto read_efuse_fail;
-	}
-
-	efuse_bits = readll_relaxed(efuse_base
-		+ efuse_data[EFUSE_ROW] * BYTES_PER_FUSE_ROW);
-
-	thermal_efuse_data = (efuse_bits >> efuse_data[EFUSE_START_BIT]) &
-						efuse_data[EFUSE_BIT_MASK];
-
-	/* Get cpu limit temp from efuse truth table */
-	for (; i < efuse_map_cnt; i++) {
-		if (efuse_values[i] == thermal_efuse_data) {
-			default_cpu_temp_limit = efuse_temp[i];
-			break;
-		}
-	}
-	if (i >= efuse_map_cnt) {
-		if (!default_temp) {
-			pr_err("No matching efuse value. value:%d\n",
-				thermal_efuse_data);
-			ret = -EINVAL;
-			goto read_efuse_fail;
+	if (info.throttling)
+	{
+		if (temp < (temp_threshold - info.safe_diff))
+		{
+			limit_cpu_freqs(info.cpuinfo_max_freq);
+			info.throttling = false;
+			goto reschedule;
 		}
 	}
 
-	pr_debug(
-	"Efuse address:0x%x [row:%d] = 0x%llx @%d:mask:0x%x = 0x%x temp:%d\n",
-		efuse_data[EFUSE_ADDRESS], efuse_data[EFUSE_ROW], efuse_bits,
-		efuse_data[EFUSE_START_BIT], efuse_data[EFUSE_BIT_MASK],
-		thermal_efuse_data, default_cpu_temp_limit);
+	if (temp >= temp_threshold + LEVEL_HELL)
+		freq = FREQ_HELL;
+	else if (temp >= temp_threshold + LEVEL_VERY_HOT)
+		freq = FREQ_VERY_HOT;
+	else if (temp >= temp_threshold + LEVEL_HOT)
+		freq = FREQ_HOT;
+	else if (temp > temp_threshold)
+		freq = FREQ_WARM;
 
-	default_temp_limit_enabled = true;
+	if (freq)
+	{
+		limit_cpu_freqs(freq);
 
-read_efuse_fail:
-	if (efuse_base)
-		iounmap(efuse_base);
-	default_temp_limit_probed = true;
-	if (ret) {
-		if (!default_temp) {
-			dev_info(&pdev->dev,
-			"%s:Failed reading node=%s, key=%s. KTM continues\n",
-				__func__, node->full_name, key);
-		} else {
-			default_temp_limit_enabled = true;
-			pr_debug("Default cpu temp limit is %d\n",
-					default_cpu_temp_limit);
-			ret = 0;
-		}
-	}
-read_efuse_exit:
-	return ret;
-}
-
-static int probe_ocr(struct device_node *node, struct msm_thermal_data *data,
-		struct platform_device *pdev)
-{
-	int ret = 0;
-	int j = 0;
-	char *key = NULL;
-
-	if (ocr_probed) {
-		pr_info("%s: Nodes already probed\n",
-			__func__);
-		goto read_ocr_exit;
-	}
-	ocr_rails = NULL;
-
-	key = "qti,pmic-opt-curr-temp";
-	ret = of_property_read_u32(node, key, &data->ocr_temp_degC);
-	if (ret)
-		goto read_ocr_fail;
-
-	key = "qti,pmic-opt-curr-temp-hysteresis";
-	ret = of_property_read_u32(node, key, &data->ocr_temp_hyst_degC);
-	if (ret)
-		goto read_ocr_fail;
-
-	key = "qti,pmic-opt-curr-regs";
-	ocr_rail_cnt = of_property_count_strings(node, key);
-	ocr_rails = kzalloc(sizeof(struct psm_rail) * ocr_rail_cnt,
-			GFP_KERNEL);
-	if (!ocr_rails) {
-		pr_err("%s: Fail to allocate memory for ocr rails\n", __func__);
-		ocr_rail_cnt = 0;
-		return -ENOMEM;
+		if (!info.throttling)
+			info.throttling = true;
 	}
 
-	for (j = 0; j < ocr_rail_cnt; j++) {
-		ret = of_property_read_string_index(node, key, j,
-				&ocr_rails[j].name);
-		if (ret)
-			goto read_ocr_fail;
-		ocr_rails[j].phase_reg = NULL;
-		ocr_rails[j].init = OPTIMUM_CURRENT_MAX;
-	}
-
-	if (ocr_rail_cnt) {
-		ret = ocr_reg_init(pdev);
-		if (ret) {
-			pr_info("%s:Failed to get regulators. KTM continues.\n",
-					__func__);
-			goto read_ocr_fail;
-		}
-		ocr_enabled = true;
-		ocr_nodes_called = false;
-		/*
-		 * Vote for max optimum current by default until we have made
-		 * our first temp reading
-		 */
-		if (ocr_set_mode_all(OPTIMUM_CURRENT_MAX))
-			pr_err("Set max optimum current failed\n");
-	}
-
-read_ocr_fail:
-	ocr_probed = true;
-	if (ret) {
-		dev_info(&pdev->dev,
-			"%s:Failed reading node=%s, key=%s. KTM continues\n",
-			__func__, node->full_name, key);
-		if (ocr_rails)
-			kfree(ocr_rails);
-		ocr_rails = NULL;
-		ocr_rail_cnt = 0;
-	}
-	if (ret == -EPROBE_DEFER)
-		ocr_probed = false;
-read_ocr_exit:
-	return ret;
-}
-
-static int probe_psm(struct device_node *node, struct msm_thermal_data *data,
-		struct platform_device *pdev)
-{
-	int ret = 0;
-	int j = 0;
-	char *key = NULL;
-
-	psm_rails = NULL;
-
-	key = "qcom,pmic-sw-mode-temp";
-	ret = of_property_read_u32(node, key, &data->psm_temp_degC);
-	if (ret)
-		goto read_node_fail;
-
-	key = "qcom,pmic-sw-mode-temp-hysteresis";
-	ret = of_property_read_u32(node, key, &data->psm_temp_hyst_degC);
-	if (ret)
-		goto read_node_fail;
-
-	key = "qcom,pmic-sw-mode-regs";
-	psm_rails_cnt = of_property_count_strings(node, key);
-	psm_rails = kzalloc(sizeof(struct psm_rail) * psm_rails_cnt,
-			GFP_KERNEL);
-	if (!psm_rails) {
-		pr_err("Fail to allocate memory for psm rails\n");
-		psm_rails_cnt = 0;
-		return -ENOMEM;
-	}
-
-	for (j = 0; j < psm_rails_cnt; j++) {
-		ret = of_property_read_string_index(node, key, j,
-				&psm_rails[j].name);
-		if (ret)
-			goto read_node_fail;
-	}
-
-	if (psm_rails_cnt) {
-		ret = psm_reg_init(pdev);
-		if (ret) {
-			pr_err("Err regulator init. err:%d. KTM continues.\n",
-					ret);
-			goto read_node_fail;
-		}
-		psm_enabled = true;
-	}
-
-read_node_fail:
-	psm_probed = true;
-	if (ret) {
-		dev_info(&pdev->dev,
-		"%s:Failed reading node=%s, key=%s. err=%d. KTM continues\n",
-			__func__, node->full_name, key, ret);
-		kfree(psm_rails);
-		psm_rails_cnt = 0;
-	}
-	if (ret == -EPROBE_DEFER)
-		psm_probed = false;
-	return ret;
-}
-
-static int probe_cc(struct device_node *node, struct msm_thermal_data *data,
-		struct platform_device *pdev)
-{
-	char *key = NULL;
-	uint32_t cpu_cnt = 0;
-	int ret = 0;
-	uint32_t cpu = 0;
-
-	if (num_possible_cpus() > 1) {
-		core_control_enabled = 1;
-		hotplug_enabled = 1;
-	}
-
-	key = "qcom,core-limit-temp";
-	ret = of_property_read_u32(node, key, &data->core_limit_temp_degC);
-	if (ret)
-		goto read_node_fail;
-
-	key = "qcom,core-temp-hysteresis";
-	ret = of_property_read_u32(node, key, &data->core_temp_hysteresis_degC);
-	if (ret)
-		goto read_node_fail;
-
-	key = "qcom,core-control-mask";
-	ret = of_property_read_u32(node, key, &data->core_control_mask);
-	if (ret)
-		goto read_node_fail;
-
-	key = "qcom,hotplug-temp";
-	ret = of_property_read_u32(node, key, &data->hotplug_temp_degC);
-	if (ret)
-		goto hotplug_node_fail;
-
-	key = "qcom,hotplug-temp-hysteresis";
-	ret = of_property_read_u32(node, key,
-			&data->hotplug_temp_hysteresis_degC);
-	if (ret)
-		goto hotplug_node_fail;
-
-	key = "qcom,cpu-sensors";
-	cpu_cnt = of_property_count_strings(node, key);
-	if (cpu_cnt < num_possible_cpus()) {
-		pr_err("Wrong number of cpu sensors:%d\n", cpu_cnt);
-		ret = -EINVAL;
-		goto hotplug_node_fail;
-	}
-
-	for_each_possible_cpu(cpu) {
-		ret = of_property_read_string_index(node, key, cpu,
-				&cpus[cpu].sensor_type);
-		if (ret)
-			goto hotplug_node_fail;
-	}
-
-read_node_fail:
-	if (ret) {
-		dev_info(&pdev->dev,
-		"%s:Failed reading node=%s, key=%s. err=%d. KTM continues\n",
-			KBUILD_MODNAME, node->full_name, key, ret);
-		core_control_enabled = 0;
-	}
-
-	return ret;
-
-hotplug_node_fail:
-	if (ret) {
-		dev_info(&pdev->dev,
-		"%s:Failed reading node=%s, key=%s. err=%d. KTM continues\n",
-			KBUILD_MODNAME, node->full_name, key, ret);
-		hotplug_enabled = 0;
-	}
-
-	return ret;
-}
-
-static int probe_therm_reset(struct device_node *node,
-		struct msm_thermal_data *data,
-		struct platform_device *pdev)
-{
-	char *key = NULL;
-	int ret = 0;
-
-	key = "qcom,therm-reset-temp";
-	ret = of_property_read_u32(node, key, &data->therm_reset_temp_degC);
-	if (ret)
-		goto PROBE_RESET_EXIT;
-
-	ret = init_threshold(MSM_THERM_RESET, MONITOR_ALL_TSENS,
-		data->therm_reset_temp_degC, data->therm_reset_temp_degC - 10,
-		therm_reset_notify);
-	if (ret) {
-		pr_err("Therm reset data structure init failed\n");
-		goto PROBE_RESET_EXIT;
-	}
-
-	therm_reset_enabled = true;
-
-PROBE_RESET_EXIT:
-	if (ret) {
-		dev_info(&pdev->dev,
-		"%s:Failed reading node=%s, key=%s err=%d. KTM continues\n",
-			__func__, node->full_name, key, ret);
-		therm_reset_enabled = false;
-	}
-	return ret;
-}
-
-static int probe_freq_mitigation(struct device_node *node,
-		struct msm_thermal_data *data,
-		struct platform_device *pdev)
-{
-	char *key = NULL;
-	int ret = 0;
-
-	key = "qcom,freq-mitigation-temp";
-	ret = of_property_read_u32(node, key, &data->freq_mitig_temp_degc);
-	if (ret)
-		goto PROBE_FREQ_EXIT;
-
-	key = "qcom,freq-mitigation-temp-hysteresis";
-	ret = of_property_read_u32(node, key,
-		&data->freq_mitig_temp_hysteresis_degc);
-	if (ret)
-		goto PROBE_FREQ_EXIT;
-
-	key = "qcom,freq-mitigation-value";
-	ret = of_property_read_u32(node, key, &data->freq_limit);
-	if (ret)
-		goto PROBE_FREQ_EXIT;
-
-	key = "qcom,freq-mitigation-control-mask";
-	ret = of_property_read_u32(node, key, &data->freq_mitig_control_mask);
-	if (ret)
-		goto PROBE_FREQ_EXIT;
-
-	freq_mitigation_enabled = 1;
-
-PROBE_FREQ_EXIT:
-	if (ret) {
-		dev_info(&pdev->dev,
-		"%s:Failed reading node=%s, key=%s. err=%d. KTM continues\n",
-			__func__, node->full_name, key, ret);
-		freq_mitigation_enabled = 0;
-	}
-	return ret;
+reschedule:
+	schedule_delayed_work_on(0, &check_temp_work, msecs_to_jiffies(250));
 }
 
 static int __devinit msm_thermal_dev_probe(struct platform_device *pdev)
 {
 	int ret = 0;
-	char *key = NULL;
 	struct device_node *node = pdev->dev.of_node;
 	struct msm_thermal_data data;
 
 	memset(&data, 0, sizeof(struct msm_thermal_data));
-	ret = msm_thermal_pre_init();
-	if (ret) {
-		pr_err("thermal pre init failed. err:%d\n", ret);
-		goto fail;
-	}
 
-	key = "qcom,sensor-id";
-	ret = of_property_read_u32(node, key, &data.sensor_id);
+	ret = of_property_read_u32(node, "qcom,sensor-id", &data.sensor_id);
 	if (ret)
-		goto fail;
+		return ret;
 
-	key = "qcom,poll-ms";
-	ret = of_property_read_u32(node, key, &data.poll_ms);
-	if (ret)
-		goto fail;
+	WARN_ON(data.sensor_id >= TSENS_MAX_SENSORS);
 
-	key = "qcom,limit-temp";
-	ret = of_property_read_u32(node, key, &data.limit_temp_degC);
-	if (ret)
-		goto fail;
+        memcpy(&msm_thermal_info, &data, sizeof(struct msm_thermal_data));
 
-	key = "qcom,temp-hysteresis";
-	ret = of_property_read_u32(node, key, &data.temp_hysteresis_degC);
-	if (ret)
-		goto fail;
+        INIT_DELAYED_WORK(&check_temp_work, check_temp);
+        schedule_delayed_work_on(0, &check_temp_work, 5);
 
-	key = "qcom,freq-step";
-	ret = of_property_read_u32(node, key, &data.bootup_freq_step);
-	if (ret)
-		goto fail;
-
-	key = "qcom,freq-control-mask";
-	ret = of_property_read_u32(node, key, &data.bootup_freq_control_mask);
-
-	ret = probe_cc(node, &data, pdev);
-
-	ret = probe_freq_mitigation(node, &data, pdev);
-	ret = probe_therm_reset(node, &data, pdev);
-
-	/*
-	 * Probe optional properties below. Call probe_psm before
-	 * probe_vdd_rstr because rpm_regulator_get has to be called
-	 * before devm_regulator_get
-	 * probe_ocr should be called after probe_vdd_rstr to reuse the
-	 * regualtor handle. calling devm_regulator_get more than once
-	 * will fail.
-	 */
-	ret = probe_psm(node, &data, pdev);
-	if (ret == -EPROBE_DEFER)
-		goto fail;
-	ret = probe_vdd_rstr(node, &data, pdev);
-	if (ret == -EPROBE_DEFER)
-		goto fail;
-	ret = probe_ocr(node, &data, pdev);
-	if (ret == -EPROBE_DEFER)
-		goto fail;
-	probe_thermal_efuse_read(node, &data, pdev);
-
-	/*
-	 * In case sysfs add nodes get called before probe function.
-	 * Need to make sure sysfs node is created again
-	 */
-	if (psm_nodes_called) {
-		msm_thermal_add_psm_nodes();
-		psm_nodes_called = false;
-	}
-	if (vdd_rstr_nodes_called) {
-		msm_thermal_add_vdd_rstr_nodes();
-		vdd_rstr_nodes_called = false;
-	}
-	if (ocr_nodes_called) {
-		msm_thermal_add_ocr_nodes();
-		ocr_nodes_called = false;
-	}
-	if (default_temp_limit_nodes_called) {
-		msm_thermal_add_default_temp_limit_nodes();
-		default_temp_limit_nodes_called = false;
-	}
-	msm_thermal_ioctl_init();
-	ret = msm_thermal_init(&data);
-	msm_thermal_probed = true;
-
-	if (interrupt_mode_enable) {
-		interrupt_mode_init();
-		interrupt_mode_enable = false;
-	}
-
-	return ret;
-fail:
-	if (ret)
-		pr_err("Failed reading node=%s, key=%s. err:%d\n",
-			node->full_name, key, ret);
+	cpufreq_register_notifier(&msm_thermal_cpufreq_notifier,
+			CPUFREQ_POLICY_NOTIFIER);
 
 	return ret;
 }
 
-static int msm_thermal_dev_exit(struct platform_device *inp_dev)
+static int msm_thermal_dev_remove(struct platform_device *pdev)
 {
-	msm_thermal_ioctl_cleanup();
-	if (thresh) {
-		if (vdd_rstr_enabled)
-			kfree(thresh[MSM_VDD_RESTRICTION].thresh_list);
-		kfree(thresh);
-		thresh = NULL;
-	}
+	cpufreq_unregister_notifier(&msm_thermal_cpufreq_notifier,
+                        CPUFREQ_POLICY_NOTIFIER);
 	return 0;
 }
 
@@ -3203,20 +2634,20 @@ static struct of_device_id msm_thermal_match_table[] = {
 
 static struct platform_driver msm_thermal_device_driver = {
 	.probe = msm_thermal_dev_probe,
+	.remove = msm_thermal_dev_remove,
 	.driver = {
 		.name = "msm-thermal",
 		.owner = THIS_MODULE,
 		.of_match_table = msm_thermal_match_table,
 	},
-	.remove = msm_thermal_dev_exit,
 };
 
-int __init msm_thermal_device_init(void)
+static int __init msm_thermal_device_init(void)
 {
 	return platform_driver_register(&msm_thermal_device_driver);
 }
 
-int __init msm_thermal_late_init(void)
+static void __exit msm_thermal_device_exit(void)
 {
 	if (num_possible_cpus() > 1)
 		msm_thermal_add_cc_nodes();
@@ -3227,6 +2658,8 @@ int __init msm_thermal_late_init(void)
 
 	interrupt_mode_init();
 	return 0;
+	platform_driver_unregister(&msm_thermal_device_driver);
 }
-late_initcall(msm_thermal_late_init);
 
+late_initcall(msm_thermal_device_init);
+module_exit(msm_thermal_device_exit);
