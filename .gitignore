@@ -15,6 +15,7 @@
 *.a
 *.s
 *.ko
+*build.sh
 */zip
 *.so
 *.so.dbg
