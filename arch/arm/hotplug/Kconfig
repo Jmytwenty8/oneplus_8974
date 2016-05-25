@@ -1,0 +1,5 @@
+config MAKO_HOTPLUG
+        bool "Enable mako_hotplug cpu hotplug driver"
+        default n
+        help
+          Generic mako_hotplug cpu hotplug driver for ARM SOCs
