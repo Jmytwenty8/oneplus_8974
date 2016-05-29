@@ -67,8 +67,6 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 #ifdef CONFIG_TURBO_BOOST
 extern int msm_turbo(int);
 #endif
-
-static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq)
 {
 	int ret = 0;
 	int saved_sched_policy = -EINVAL;
