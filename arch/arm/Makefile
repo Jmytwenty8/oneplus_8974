@@ -268,7 +268,7 @@ core-y				+= arch/arm/net/
 core-y				+= arch/arm/crypto/
 core-y				+= $(machdirs) $(platdirs)
 core-$(CONFIG_MAKO_HOTPLUG)	+= arch/arm/hotplug/
-core-$(CONFIG_BLU_PLUG)	        += arch/arm/hotplug/
+core-$(CONFIG_BLU_PLUG)         += arch/arm/hotplug/blu_plug/
 
 drivers-$(CONFIG_OPROFILE)      += arch/arm/oprofile/
 core-y				+= arch/arm/perfmon/
