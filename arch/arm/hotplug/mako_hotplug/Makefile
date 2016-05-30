@@ -1,1 +1,1 @@
-obj-y += mako_hotplug.o
+obj-$(CONFIG_MAKO_HOTPLUG)    += mako_hotplug.o
